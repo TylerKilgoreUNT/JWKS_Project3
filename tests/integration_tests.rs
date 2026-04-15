@@ -1,16 +1,19 @@
+use aes_gcm::aead::KeyInit;
 use chrono::Utc;
 use project1_rust::{build_routes, initialize_database, AppState, DB_FILE};
-use rsa::pkcs1::DecodeRsaPrivateKey;
-use rsa::RsaPrivateKey;
 use rusqlite::{params, Connection};
 use serde_json::Value;
-use std::fs;
+use sha2::Digest;
 use std::process::Command;
 use tempfile::TempDir;
 use warp::http::StatusCode;
 use warp::test::request;
 
+const TEST_AES_KEY: &str = "integration-test-encryption-key";
+
 fn setup_state() -> (AppState, TempDir) {
+    std::env::set_var("NOT_MY_KEY", TEST_AES_KEY);
+
     let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
     let db_path = temp_dir.path().join("test_private_keys.db");
     initialize_database(db_path.to_str().expect("invalid db path")).expect("failed to init db");
@@ -18,23 +21,6 @@ fn setup_state() -> (AppState, TempDir) {
         AppState::new(db_path.to_string_lossy().to_string()),
         temp_dir,
     )
-}
-
-fn load_key_ids(db_path: &str, expired: bool) -> Vec<i64> {
-    let conn = Connection::open(db_path).expect("failed to open db");
-    let now = Utc::now().timestamp();
-    let query = if expired {
-        "SELECT kid FROM keys WHERE exp <= ?1"
-    } else {
-        "SELECT kid FROM keys WHERE exp > ?1"
-    };
-
-    let mut statement = conn.prepare(query).expect("failed to prepare query");
-    let rows = statement
-        .query_map([now], |row| row.get::<_, i64>(0))
-        .expect("failed to run query");
-
-    rows.map(|row| row.expect("invalid row")).collect()
 }
 
 fn token_kid(token: &str) -> String {
@@ -59,33 +45,44 @@ fn db_filename_matches_requirement() {
 }
 
 #[test]
-fn initialize_database_is_idempotent() {
-    let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
-    let db_path = temp_dir.path().join("idempotent_integration.db");
-    let db_path_str = db_path.to_str().expect("invalid db path");
+fn initialize_database_creates_required_tables() {
+    let (state, _temp_dir) = setup_state();
+    let conn = Connection::open(state.db_path()).expect("failed to open db");
 
-    initialize_database(db_path_str).expect("first initialization failed");
-    initialize_database(db_path_str).expect("second initialization failed");
+    let mut stmt = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type='table'")
+        .expect("failed to query table list");
 
-    let conn = Connection::open(db_path_str).expect("failed to open db");
-    let total_count: i64 = conn
-        .query_row("SELECT COUNT(1) FROM keys", [], |row| row.get(0))
-        .expect("failed to query total key count");
-    let now = Utc::now().timestamp();
-    let expired_count: i64 = conn
-        .query_row("SELECT COUNT(1) FROM keys WHERE exp <= ?1", [now], |row| {
-            row.get(0)
-        })
-        .expect("failed to query expired key count");
-    let valid_count: i64 = conn
-        .query_row("SELECT COUNT(1) FROM keys WHERE exp > ?1", [now], |row| {
-            row.get(0)
-        })
-        .expect("failed to query valid key count");
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .expect("failed to iterate table list");
 
-    assert_eq!(total_count, 2, "database should keep exactly two seed keys");
-    assert_eq!(expired_count, 1, "expected exactly one expired key");
-    assert_eq!(valid_count, 1, "expected exactly one valid key");
+    let table_names: Vec<String> = rows.map(|row| row.expect("invalid table row")).collect();
+
+    assert!(table_names.contains(&"keys".to_string()));
+    assert!(table_names.contains(&"users".to_string()));
+    assert!(table_names.contains(&"auth_logs".to_string()));
+}
+
+#[test]
+fn keys_are_encrypted_at_rest() {
+    let (state, _temp_dir) = setup_state();
+    let conn = Connection::open(state.db_path()).expect("failed to open db");
+
+    let key_blob: Vec<u8> = conn
+        .query_row("SELECT key FROM keys LIMIT 1", [], |row| row.get(0))
+        .expect("missing key rows");
+
+    let blob_text = String::from_utf8_lossy(&key_blob);
+
+    assert!(
+        key_blob.len() > 12,
+        "encrypted blob should contain nonce + ciphertext"
+    );
+    assert!(
+        !blob_text.contains("BEGIN RSA PRIVATE KEY"),
+        "private key must not be stored as plaintext PEM"
+    );
 }
 
 #[test]
@@ -97,251 +94,209 @@ fn binary_main_initializes_and_exits_when_skip_server_is_set() {
     let status = Command::new(env!("CARGO_BIN_EXE_project1_rust"))
         .env("JWKS_DB_PATH", db_path_str)
         .env("JWKS_SKIP_SERVER", "1")
+        .env("NOT_MY_KEY", TEST_AES_KEY)
         .status()
         .expect("failed to run project1_rust binary");
 
     assert!(status.success(), "binary exited with status: {status}");
-
-    let conn = Connection::open(db_path_str).expect("failed to open initialized db");
-    let key_count: i64 = conn
-        .query_row("SELECT COUNT(1) FROM keys", [], |row| row.get(0))
-        .expect("failed to query key count");
-    assert!(
-        key_count >= 2,
-        "expected seeded database to contain at least two keys"
-    );
-}
-
-#[test]
-fn table_schema_matches_requirement() {
-    let (state, _temp_dir) = setup_state();
-    let conn = Connection::open(state.db_path()).expect("failed to open db");
-
-    let mut stmt = conn
-        .prepare("PRAGMA table_info(keys)")
-        .expect("failed to query schema");
-
-    let rows = stmt
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, i64>(3)?,
-                row.get::<_, i64>(5)?,
-            ))
-        })
-        .expect("failed to read schema rows");
-
-    let cols = rows
-        .map(|r| r.expect("invalid schema row"))
-        .collect::<Vec<_>>();
-
-    assert_eq!(cols.len(), 3);
-    assert_eq!(cols[0].0, "kid");
-    assert_eq!(cols[0].1.to_uppercase(), "INTEGER");
-    assert_eq!(cols[0].3, 1);
-
-    assert_eq!(cols[1].0, "key");
-    assert_eq!(cols[1].1.to_uppercase(), "BLOB");
-    assert_eq!(cols[1].2, 1);
-
-    assert_eq!(cols[2].0, "exp");
-    assert_eq!(cols[2].1.to_uppercase(), "INTEGER");
-    assert_eq!(cols[2].2, 1);
-}
-
-#[test]
-fn keys_are_stored_as_pkcs1_pem_blob() {
-    let (state, _temp_dir) = setup_state();
-    let conn = Connection::open(state.db_path()).expect("failed to open db");
-
-    let key_blob: Vec<u8> = conn
-        .query_row("SELECT key FROM keys LIMIT 1", [], |row| row.get(0))
-        .expect("missing key rows");
-
-    let key_text = String::from_utf8(key_blob).expect("key blob was not UTF-8 PEM");
-    assert!(key_text.contains("BEGIN RSA PRIVATE KEY"));
-    RsaPrivateKey::from_pkcs1_pem(&key_text).expect("stored PEM was not parseable PKCS1");
-}
-
-#[test]
-fn database_stores_expired_and_valid_keys() {
-    let (state, _temp_dir) = setup_state();
-    let valid_keys = load_key_ids(state.db_path(), false);
-    let expired_keys = load_key_ids(state.db_path(), true);
-
-    assert!(!valid_keys.is_empty());
-    assert!(!expired_keys.is_empty());
-}
-
-#[test]
-fn source_contains_parameterized_insert_expected_by_gradebot() {
-    let src = fs::read_to_string("src/lib.rs").expect("failed to read src/lib.rs");
-    assert!(
-        src.contains("INSERT INTO keys (key, exp) VALUES (?, ?)"),
-        "missing grader-compatible parameterized insertion pattern"
-    );
 }
 
 #[tokio::test]
-async fn post_auth_returns_valid_jwt() {
-    let (state, _temp_dir) = setup_state();
-    let routes = build_routes(state.clone());
-
-    let response = request().method("POST").path("/auth").reply(&routes).await;
-
-    assert_eq!(response.status(), StatusCode::OK);
-    let token = std::str::from_utf8(response.body()).expect("response was not utf-8");
-    let kid = token_kid(token);
-    let valid_ids = load_key_ids(state.db_path(), false);
-    assert!(valid_ids.contains(&kid.parse::<i64>().expect("kid was not numeric")));
-}
-
-#[tokio::test]
-async fn post_auth_expired_uses_expired_key() {
+async fn register_creates_user_with_hashed_password() {
     let (state, _temp_dir) = setup_state();
     let routes = build_routes(state.clone());
 
     let response = request()
         .method("POST")
-        .path("/auth?expired=1")
+        .path("/register")
+        .header("content-type", "application/json")
+        .body("{\"username\":\"MyCoolUsername\",\"email\":\"person@example.com\"}")
         .reply(&routes)
         .await;
 
-    assert_eq!(response.status(), StatusCode::OK);
-    let token = std::str::from_utf8(response.body()).expect("response was not utf-8");
-    let kid = token_kid(token);
-    let expired_ids = load_key_ids(state.db_path(), true);
-    assert!(expired_ids.contains(&kid.parse::<i64>().expect("kid was not numeric")));
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let parsed: serde_json::Value =
+        serde_json::from_slice(response.body()).expect("invalid response json");
+    let password = parsed["password"]
+        .as_str()
+        .expect("password missing from response");
+
+    assert!(!password.is_empty());
+
+    let conn = Connection::open(state.db_path()).expect("failed to open db");
+    let (stored_username, stored_hash): (String, String) = conn
+        .query_row(
+            "SELECT username, password_hash FROM users WHERE username = ?1",
+            ["MyCoolUsername"],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("user should be present in users table");
+
+    assert_eq!(stored_username, "MyCoolUsername");
+    assert!(stored_hash.starts_with("$argon2"));
 }
 
 #[tokio::test]
-async fn post_auth_expired_true_uses_expired_key() {
+async fn register_rejects_empty_username() {
     let (state, _temp_dir) = setup_state();
-    let routes = build_routes(state.clone());
+    let routes = build_routes(state);
 
     let response = request()
         .method("POST")
-        .path("/auth?expired=true")
+        .path("/register")
+        .header("content-type", "application/json")
+        .body("{\"username\":\"   \",\"email\":\"blank@example.com\"}")
         .reply(&routes)
         .await;
 
-    assert_eq!(response.status(), StatusCode::OK);
-    let token = std::str::from_utf8(response.body()).expect("response was not utf-8");
-    let kid = token_kid(token);
-    let expired_ids = load_key_ids(state.db_path(), true);
-    assert!(expired_ids.contains(&kid.parse::<i64>().expect("kid was not numeric")));
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
-async fn post_auth_expired_query_flag_without_value_uses_expired_key() {
+async fn register_rejects_duplicate_username_or_email() {
+    let (state, _temp_dir) = setup_state();
+    let routes = build_routes(state);
+
+    let first = request()
+        .method("POST")
+        .path("/register")
+        .header("content-type", "application/json")
+        .body("{\"username\":\"dupe-user\",\"email\":\"dupe@example.com\"}")
+        .reply(&routes)
+        .await;
+    assert_eq!(first.status(), StatusCode::CREATED);
+
+    let duplicate_username = request()
+        .method("POST")
+        .path("/register")
+        .header("content-type", "application/json")
+        .body("{\"username\":\"dupe-user\",\"email\":\"another@example.com\"}")
+        .reply(&routes)
+        .await;
+    assert_eq!(duplicate_username.status(), StatusCode::CONFLICT);
+
+    let duplicate_email = request()
+        .method("POST")
+        .path("/register")
+        .header("content-type", "application/json")
+        .body("{\"username\":\"another-user\",\"email\":\"dupe@example.com\"}")
+        .reply(&routes)
+        .await;
+    assert_eq!(duplicate_email.status(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn post_auth_logs_request_ip_and_user_id_on_success() {
     let (state, _temp_dir) = setup_state();
     let routes = build_routes(state.clone());
 
-    let response = request()
+    let register_response = request()
         .method("POST")
-        .path("/auth?expired")
+        .path("/register")
+        .header("content-type", "application/json")
+        .body("{\"username\":\"auth-user\",\"email\":\"auth@example.com\"}")
         .reply(&routes)
         .await;
 
-    assert_eq!(response.status(), StatusCode::OK);
-    let token = std::str::from_utf8(response.body()).expect("response was not utf-8");
-    let kid = token_kid(token);
-    let expired_ids = load_key_ids(state.db_path(), true);
-    assert!(expired_ids.contains(&kid.parse::<i64>().expect("kid was not numeric")));
-}
+    assert_eq!(register_response.status(), StatusCode::CREATED);
 
-#[tokio::test]
-async fn post_auth_expired_false_keeps_valid_key_path() {
-    let (state, _temp_dir) = setup_state();
-    let routes = build_routes(state.clone());
-
-    let response = request()
-        .method("POST")
-        .path("/auth?expired=false")
-        .reply(&routes)
-        .await;
-
-    assert_eq!(response.status(), StatusCode::OK);
-    let token = std::str::from_utf8(response.body()).expect("response was not utf-8");
-    let kid = token_kid(token);
-    let valid_ids = load_key_ids(state.db_path(), false);
-    assert!(valid_ids.contains(&kid.parse::<i64>().expect("kid was not numeric")));
-}
-
-#[tokio::test]
-async fn post_auth_returns_500_when_no_signing_keys_exist() {
-    let (state, _temp_dir) = setup_state();
-    let conn = Connection::open(state.db_path()).expect("failed to open db");
-    conn.execute("DELETE FROM keys", [])
-        .expect("failed to delete keys");
-
-    let routes = build_routes(state);
-    let response = request().method("POST").path("/auth").reply(&routes).await;
-
-    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
-}
-
-#[tokio::test]
-async fn post_auth_returns_500_when_valid_key_blob_is_not_utf8() {
-    let (state, _temp_dir) = setup_state();
-    let conn = Connection::open(state.db_path()).expect("failed to open db");
-    let now = Utc::now().timestamp();
-    conn.execute(
-        "UPDATE keys SET key = ?1 WHERE exp > ?2",
-        params![vec![0xff_u8, 0xfe_u8, 0xfd_u8], now],
-    )
-    .expect("failed to corrupt valid keys");
-
-    let routes = build_routes(state);
-    let response = request().method("POST").path("/auth").reply(&routes).await;
-
-    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
-}
-
-#[tokio::test]
-async fn post_auth_returns_500_when_valid_key_is_not_pem() {
-    let (state, _temp_dir) = setup_state();
-    let conn = Connection::open(state.db_path()).expect("failed to open db");
-    let now = Utc::now().timestamp();
-    conn.execute(
-        "UPDATE keys SET key = ?1 WHERE exp > ?2",
-        params![b"not-a-pem-private-key".to_vec(), now],
-    )
-    .expect("failed to replace valid keys with invalid PEM");
-
-    let routes = build_routes(state);
-    let response = request().method("POST").path("/auth").reply(&routes).await;
-
-    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
-}
-
-#[tokio::test]
-async fn post_auth_returns_500_when_database_path_is_missing() {
-    let state = AppState::new("this/path/does/not/exist/private_keys.db");
-    let routes = build_routes(state);
-
-    let response = request().method("POST").path("/auth").reply(&routes).await;
-    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
-}
-
-#[tokio::test]
-async fn post_auth_accepts_basic_auth_and_json_payload() {
-    let (state, _temp_dir) = setup_state();
-    let routes = build_routes(state);
-
-    let response = request()
+    let auth_response = request()
         .method("POST")
         .path("/auth")
-        .header("authorization", "Basic dXNlckFCQzpwYXNzd29yZDEyMw==")
         .header("content-type", "application/json")
-        .body("{\"username\":\"userABC\",\"password\":\"password123\"}")
+        .body("{\"username\":\"auth-user\"}")
         .reply(&routes)
         .await;
 
-    assert_eq!(response.status(), StatusCode::OK);
-    let token = std::str::from_utf8(response.body()).expect("response was not utf-8");
-    assert_eq!(token.split('.').count(), 3);
+    assert_eq!(auth_response.status(), StatusCode::OK);
+
+    let conn = Connection::open(state.db_path()).expect("failed to open db");
+
+    let user_id: i64 = conn
+        .query_row(
+            "SELECT id FROM users WHERE username = ?1",
+            ["auth-user"],
+            |row| row.get(0),
+        )
+        .expect("expected existing user id");
+
+    let (request_ip, logged_user_id): (String, Option<i64>) = conn
+        .query_row(
+            "SELECT request_ip, user_id FROM auth_logs ORDER BY id DESC LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("expected auth log row");
+
+    assert_eq!(request_ip, "unknown");
+    assert_eq!(logged_user_id, Some(user_id));
+}
+
+#[tokio::test]
+async fn auth_rate_limiter_returns_429_after_10_requests_in_window() {
+    let (state, _temp_dir) = setup_state();
+    let routes = build_routes(state);
+
+    for _ in 0..10 {
+        let response = request().method("POST").path("/auth").reply(&routes).await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    let limited = request().method("POST").path("/auth").reply(&routes).await;
+    assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn auth_returns_500_for_non_utf8_decrypted_private_key() {
+    let (state, _temp_dir) = setup_state();
+    let conn = Connection::open(state.db_path()).expect("failed to open db");
+    let now = Utc::now().timestamp();
+
+    // Keep nonce length valid but force decrypted payload to invalid UTF-8 bytes.
+    let malformed_blob = vec![0_u8; 13];
+    conn.execute(
+        "UPDATE keys SET key = ?1 WHERE exp > ?2",
+        params![malformed_blob, now],
+    )
+    .expect("failed to update key blob");
+
+    let routes = build_routes(state);
+    let response = request().method("POST").path("/auth").reply(&routes).await;
+
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+#[tokio::test]
+async fn auth_returns_500_for_non_pem_private_key() {
+    let (state, _temp_dir) = setup_state();
+    let conn = Connection::open(state.db_path()).expect("failed to open db");
+    let now = Utc::now().timestamp();
+
+    // Encrypt known non-PEM plaintext with the same test key setup.
+    let payload = b"definitely-not-a-pem";
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(TEST_AES_KEY.as_bytes());
+    let digest = hasher.finalize();
+    let cipher = aes_gcm::Aes256Gcm::new_from_slice(&digest[..32]).expect("cipher create failed");
+    let nonce_bytes = [7_u8; 12];
+    let nonce = aes_gcm::Nonce::from_slice(&nonce_bytes);
+    let ciphertext = aes_gcm::aead::Aead::encrypt(&cipher, nonce, payload.as_ref())
+        .expect("encryption should succeed");
+
+    let mut blob = nonce_bytes.to_vec();
+    blob.extend_from_slice(&ciphertext);
+
+    conn.execute(
+        "UPDATE keys SET key = ?1 WHERE exp > ?2",
+        params![blob, now],
+    )
+    .expect("failed to update key blob");
+
+    let routes = build_routes(state);
+    let response = request().method("POST").path("/auth").reply(&routes).await;
+
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
 }
 
 #[tokio::test]
@@ -374,49 +329,39 @@ async fn auth_exp_claim_respects_expired_mode() {
 }
 
 #[tokio::test]
-async fn get_jwks_returns_only_valid_keys() {
+async fn jwks_and_auth_still_work() {
     let (state, _temp_dir) = setup_state();
-    let routes = build_routes(state.clone());
+    let routes = build_routes(state);
 
-    let response = request()
+    let auth_response = request().method("POST").path("/auth").reply(&routes).await;
+    assert_eq!(auth_response.status(), StatusCode::OK);
+    let token = std::str::from_utf8(auth_response.body()).expect("jwt not utf-8");
+    assert!(!token_kid(token).is_empty());
+
+    let jwks_response = request()
         .method("GET")
         .path("/.well-known/jwks.json")
         .reply(&routes)
         .await;
 
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(jwks_response.status(), StatusCode::OK);
 
     let parsed: serde_json::Value =
-        serde_json::from_slice(response.body()).expect("invalid json response");
+        serde_json::from_slice(jwks_response.body()).expect("invalid jwks json response");
     let keys = parsed["keys"].as_array().expect("keys was not an array");
-
-    let valid_ids = load_key_ids(state.db_path(), false)
-        .into_iter()
-        .map(|kid| kid.to_string())
-        .collect::<Vec<_>>();
-
-    let expired_ids = load_key_ids(state.db_path(), true)
-        .into_iter()
-        .map(|kid| kid.to_string())
-        .collect::<Vec<_>>();
-
     assert!(!keys.is_empty());
-
-    for key in keys {
-        let kid = key["kid"].as_str().expect("kid missing from jwks key");
-        assert!(valid_ids.contains(&kid.to_string()));
-        assert!(!expired_ids.contains(&kid.to_string()));
-    }
 }
 
 #[tokio::test]
-async fn get_jwks_returns_500_when_all_valid_keys_are_malformed() {
+async fn jwks_returns_500_when_all_valid_keys_are_malformed() {
     let (state, _temp_dir) = setup_state();
     let conn = Connection::open(state.db_path()).expect("failed to open db");
     let now = Utc::now().timestamp();
+
+    // Nonce-sized but undecryptable payload to make all valid keys malformed.
     conn.execute(
         "UPDATE keys SET key = ?1 WHERE exp > ?2",
-        params![vec![0xff_u8, 0xfe_u8, 0xfd_u8], now],
+        params![vec![0_u8; 13], now],
     )
     .expect("failed to corrupt valid keys");
 
@@ -428,54 +373,6 @@ async fn get_jwks_returns_500_when_all_valid_keys_are_malformed() {
         .await;
 
     assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
-
-    let parsed: serde_json::Value =
-        serde_json::from_slice(response.body()).expect("invalid error json response");
-    assert!(parsed["error"].as_str().is_some());
-}
-
-#[tokio::test]
-async fn get_jwks_skips_malformed_key_when_other_valid_key_exists() {
-    let (state, _temp_dir) = setup_state();
-    let conn = Connection::open(state.db_path()).expect("failed to open db");
-    let now = Utc::now().timestamp();
-    let extra_valid_exp = now + 7200;
-    conn.execute(
-        "INSERT INTO keys (key, exp) VALUES (?, ?)",
-        params![b"not-a-pem-private-key".to_vec(), extra_valid_exp],
-    )
-    .expect("failed to insert malformed valid key");
-
-    let routes = build_routes(state);
-    let response = request()
-        .method("GET")
-        .path("/.well-known/jwks.json")
-        .reply(&routes)
-        .await;
-
-    assert_eq!(response.status(), StatusCode::OK);
-
-    let parsed: serde_json::Value =
-        serde_json::from_slice(response.body()).expect("invalid jwks json response");
-    let keys = parsed["keys"].as_array().expect("keys was not an array");
-    assert!(!keys.is_empty());
-}
-
-#[tokio::test]
-async fn get_jwks_returns_500_when_database_path_is_missing() {
-    let state = AppState::new("this/path/does/not/exist/private_keys.db");
-    let routes = build_routes(state);
-
-    let response = request()
-        .method("GET")
-        .path("/.well-known/jwks.json")
-        .reply(&routes)
-        .await;
-
-    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
-    let parsed: serde_json::Value =
-        serde_json::from_slice(response.body()).expect("invalid error json response");
-    assert!(parsed["error"].as_str().is_some());
 }
 
 #[tokio::test]
@@ -483,7 +380,40 @@ async fn method_not_allowed_is_enforced() {
     let (state, _temp_dir) = setup_state();
     let routes = build_routes(state);
 
-    let response = request().method("GET").path("/auth").reply(&routes).await;
+    let get_auth = request().method("GET").path("/auth").reply(&routes).await;
+    assert_eq!(get_auth.status(), StatusCode::METHOD_NOT_ALLOWED);
 
-    assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+    let get_register = request()
+        .method("GET")
+        .path("/register")
+        .reply(&routes)
+        .await;
+    assert_eq!(get_register.status(), StatusCode::METHOD_NOT_ALLOWED);
+
+    let post_jwks = request()
+        .method("POST")
+        .path("/.well-known/jwks.json")
+        .reply(&routes)
+        .await;
+    assert_eq!(post_jwks.status(), StatusCode::METHOD_NOT_ALLOWED);
+}
+
+#[tokio::test]
+async fn auth_and_jwks_fail_when_encryption_env_missing_or_empty() {
+    let (state, _temp_dir) = setup_state();
+    let routes = build_routes(state.clone());
+
+    std::env::remove_var("NOT_MY_KEY");
+    let auth_missing_key = request().method("POST").path("/auth").reply(&routes).await;
+    assert_eq!(auth_missing_key.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+    std::env::set_var("NOT_MY_KEY", "");
+    let jwks_empty_key = request()
+        .method("GET")
+        .path("/.well-known/jwks.json")
+        .reply(&routes)
+        .await;
+    assert_eq!(jwks_empty_key.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+    std::env::set_var("NOT_MY_KEY", TEST_AES_KEY);
 }

@@ -41,6 +41,8 @@ mod tests {
 
     #[test]
     fn initialize_state_creates_db_file() {
+        std::env::set_var("NOT_MY_KEY", "main-test-encryption-key");
+
         let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
         let db_path = temp_dir.path().join("main_unit_test.db");
         let db_path_str = db_path.to_str().expect("invalid db path");
@@ -53,6 +55,8 @@ mod tests {
 
     #[test]
     fn initialize_state_errors_for_missing_parent_directory() {
+        std::env::set_var("NOT_MY_KEY", "main-test-encryption-key");
+
         let err = match initialize_state("this/path/does/not/exist/main_unit_test.db") {
             Ok(_) => panic!("initialize_state should fail for missing parent directory"),
             Err(err) => err,
