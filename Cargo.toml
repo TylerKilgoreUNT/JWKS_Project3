@@ -1,0 +1,20 @@
+[package]
+name = "project1_rust"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+jsonwebtoken = "8.3.0"
+warp = "0.3"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+base64-url = "2.0.0"
+rsa = "0.9.2"
+rand = "0.8"
+pem = "3.0.2"
+chrono = "0.4.31"
+rusqlite = { version = "0.32.1", features = ["bundled"] }
+
+[dev-dependencies]
+tempfile = "3.14.0"
