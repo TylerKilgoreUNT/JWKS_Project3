@@ -2,6 +2,18 @@
 
 Secure JWKS server in Rust with encrypted private key storage, user registration, authentication request logging, and request rate limiting.
 
+## Tech Stack
+
+- Language: Rust (Edition 2021)
+- Web framework: Warp
+- Async runtime: Tokio
+- Database: SQLite (rusqlite, bundled)
+- Cryptography: AES-256-GCM, RSA, SHA-256
+- Password hashing: Argon2id
+- JWT: jsonwebtoken
+- Serialization: serde / serde_json
+- Testing/coverage: cargo test, cargo llvm-cov
+
 ## Security and Feature Summary
 
 - Private keys are stored encrypted in SQLite using AES-256-GCM.
@@ -59,9 +71,27 @@ export NOT_MY_KEY="replace-with-a-strong-secret"
 
 Run server:
 
+```powershell
+$env:NOT_MY_KEY="replace-with-a-strong-secret"
 cargo run
+```
 
 Server binds to 127.0.0.1:8080.
+
+## Run Instructions
+
+Testing coverage summary:
+
+```powershell
+cargo llvm-cov --workspace --all-features --summary-only
+```
+
+Gradebot (Project 3):
+
+```powershell
+cargo build
+.\gradebot.exe project-3 --dir . --code-dir . --database totally_not_my_privateKeys.db --port 8080 --run '.\target\debug\project1_rust.exe' -e "NOT_MY_KEY=gradebot-run-key"
+```
 
 ## Quality Gates
 
